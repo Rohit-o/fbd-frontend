@@ -658,33 +658,53 @@ table.audit-tbl td{padding:7px 11px;vertical-align:top;}
 // ── API Configuration — replaces GAS ──────────────────────────────────
 const API_URL = 'https://fbd-api.onrender.com'; // Node.js + Neon PostgreSQL backend
 
+// ── API Key — must match API_KEY in Render environment variables ──────
+const API_KEY = 'fbd-cadila-2026-secure-key';
+
+// ── Authenticated fetch — adds API key header to every request ────────
+async function apiFetch(url, options = {}) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-api-key': API_KEY,
+    ...(options.headers || {}),
+  };
+  return fetch(url, { ...options, headers });
+}
+
 // ── PIN security ─────────────────────────────────────────────────────
 // Uses crypto.subtle (SHA-256) when available (HTTPS/localhost).
+// Salt = employeeId so same PIN produces different hash per user.
 // Falls back to simple obfuscation for file:// so it always works.
-async function hashPin(pin) {
+async function hashPin(pin, salt) {
   try {
     if (window.crypto?.subtle) {
-      const msgBuffer = new TextEncoder().encode(String(pin));
+      // Salted hash — salt is employeeId
+      const saltedInput = salt ? `${salt}:${String(pin)}` : String(pin);
+      const msgBuffer = new TextEncoder().encode(saltedInput);
       const hashBuffer = await window.crypto.subtle.digest('SHA-256', msgBuffer);
       const hashArray  = Array.from(new Uint8Array(hashBuffer));
       return 'sha256:' + hashArray.map(b => b.toString(16).padStart(2,'0')).join('');
     }
   } catch(e) {}
   // Fallback: simple reversible obfuscation (works on file://)
-  // Not cryptographic but prevents casual reading of localStorage
   const s = String(pin);
   const key = [7, 13, 3, 11];
   const obf = s.split('').map((c,i) => (parseInt(c) ^ key[i % key.length]).toString(16)).join('');
   return 'obf:' + obf;
 }
 
-async function verifyPin(enteredPin, storedValue) {
+async function verifyPin(enteredPin, storedValue, salt) {
   if (!storedValue) return false;
   // Legacy plain-text (4 digits) — migrate on first verify
   if (/^\d{4}$/.test(storedValue)) {
     return String(enteredPin) === storedValue;
   }
-  // Hash the entered PIN using same method as stored
+  // Try salted hash first (new users), then unsalted (existing users)
+  if (salt) {
+    const saltedHash = await hashPin(enteredPin, salt);
+    if (saltedHash === storedValue) return true;
+  }
+  // Fallback: unsalted hash (backward compat for existing users)
   const hash = await hashPin(enteredPin);
   return hash === storedValue;
 }
@@ -2426,7 +2446,7 @@ async function submitDestructionJustification(ts, cumB, cumD) {
   unlockKeyboard();
   autoSaveBagToSheet(bag);
   // Save pending destruction to Neon
-  fetch(`${API_URL}/destruction`, {
+  apiFetch(`${API_URL}/destruction`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2850,7 +2870,7 @@ function renderDestructionRecord() {
 async function autoSaveBagToSheet(bag) {
   if (!bag || !navigator.onLine) return;
   try {
-    await fetch(`${API_URL}/bags`, {
+    await apiFetch(`${API_URL}/bags`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2935,7 +2955,7 @@ async function silentSyncFromSheets() {
     const url = currentUser.role === 'Operator'
       ? `${API_URL}/bags/user/${encodeURIComponent(currentUser.name)}`
       : `${API_URL}/bags`;
-    const r    = await fetch(url);
+    const r    = await apiFetch(url);
     const data = await r.json();
     if (indicator) indicator.style.display = 'none';
     if (!data.bags || !data.bags.length) return;
@@ -2958,7 +2978,7 @@ async function restoreFromSheets() {
     const url  = currentUser.role === 'Operator'
       ? `${API_URL}/bags/user/${encodeURIComponent(currentUser.name)}`
       : `${API_URL}/bags`;
-    const r    = await fetch(url);
+    const r    = await apiFetch(url);
     const data = await r.json();
     if (data.bags && data.bags.length) {
       const myBags   = filterBagsForCurrentUser(data.bags.map(mapDbBag));
@@ -2970,7 +2990,7 @@ async function restoreFromSheets() {
     }
   } catch(e) {}
   try {
-    const r2   = await fetch(`${API_URL}/audit`);
+    const r2   = await apiFetch(`${API_URL}/audit`);
     const d2   = await r2.json();
     if (d2.entries && d2.entries.length) {
       const myRows = currentUser.role === 'Operator'
@@ -2983,7 +3003,7 @@ async function restoreFromSheets() {
     }
   } catch(e) {}
   try {
-    const r3   = await fetch(`${API_URL}/approvals`);
+    const r3   = await apiFetch(`${API_URL}/approvals`);
     const d3   = await r3.json();
     if (d3.approvals && d3.approvals.length) {
       _approvalQueue = d3.approvals;
@@ -3006,7 +3026,7 @@ async function loadBagsFromSheet() {
     const url  = currentUser
       ? (currentUser.role === 'Operator' ? `${API_URL}/bags/user/${encodeURIComponent(currentUser.name)}` : `${API_URL}/bags`)
       : `${API_URL}/bags`;
-    const r    = await fetch(url);
+    const r    = await apiFetch(url);
     const data = await r.json();
     if (data.bags) {
       const myBags   = filterBagsForCurrentUser(data.bags.map(mapDbBag));
@@ -3027,7 +3047,7 @@ async function saveBagToSheet() {
   const bag = activeBag(); if (!bag) return;
   showAlert('Saving to server…', 'info', 'Saving');
   try {
-    await fetch(`${API_URL}/bags`, {
+    await apiFetch(`${API_URL}/bags`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3436,7 +3456,7 @@ async function sendEmail(recipients, subject, body) {
   const valid = recipients.filter(r => r && r.trim());
   if (!valid.length) return;
   try {
-    await fetch(`${API_URL}/send-email`, {
+    await apiFetch(`${API_URL}/send-email`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ recipients: valid, subject, body }),
@@ -3757,7 +3777,7 @@ async function saveUsageLogToApi(bag, rowIdx) {
   const r = bag.rows[rowIdx];
   if (!r) return;
   try {
-    await fetch(`${API_URL}/bags/${bag.id}/logs`, {
+    await apiFetch(`${API_URL}/bags/${bag.id}/logs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3791,7 +3811,7 @@ async function flushAuditQueue() {
   for (const item of q) {
     const row = item.row || item;
     try {
-      await fetch(`${API_URL}/audit`, {
+      await apiFetch(`${API_URL}/audit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3951,7 +3971,7 @@ async function pollApprovalDecisions() {
   if (!navigator.onLine) return;
 
   try {
-    const r    = await fetch(`${API_URL}/approvals`);
+    const r    = await apiFetch(`${API_URL}/approvals`);
     const data = await r.json();
     if (!data.approvals) return;
 
@@ -4195,7 +4215,7 @@ let AUDIT_DEV_PIN = null; // loaded from Neon on first use
 async function getDevPin() {
   if (AUDIT_DEV_PIN) return AUDIT_DEV_PIN;
   try {
-    const r    = await fetch(`${API_URL}/users/DEV001`);
+    const r    = await apiFetch(`${API_URL}/users/DEV001`);
     const data = await r.json();
     if (data.user?.pin_hash) {
       AUDIT_DEV_PIN = data.user.pin_hash;
@@ -4479,7 +4499,7 @@ function loadSession() {
 async function fetchUserFromSheets(empId) {
   if (!navigator.onLine) return null;
   try {
-    const r    = await fetch(`${API_URL}/users/${encodeURIComponent(empId)}`);
+    const r    = await apiFetch(`${API_URL}/users/${encodeURIComponent(empId)}`);
     const data = await r.json();
     if (data.user) {
       // Map DB format to app format
@@ -4520,7 +4540,7 @@ async function restoreBagsFromNeon(user) {
     const url  = user.role === 'Operator'
       ? `${API_URL}/bags/user/${encodeURIComponent(user.name)}`
       : `${API_URL}/bags`;
-    const r    = await fetch(url);
+    const r    = await apiFetch(url);
     const data = await r.json();
     if (data.bags && data.bags.length) {
       const myBags    = filterBagsForCurrentUser(data.bags.map(mapDbBag));
@@ -4536,7 +4556,7 @@ async function restoreBagsFromNeon(user) {
 // ── Save user to Sheets on registration ──────────────────────────
 async function saveUserToSheets(user) {
   try {
-    await fetch(`${API_URL}/users`, {
+    await apiFetch(`${API_URL}/users`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -4799,7 +4819,7 @@ async function submitSignIn() {
     err.style.display = 'block'; return;
   }
 
-  const ok = await verifyPin(pin, user.pin);
+  const ok = await verifyPin(pin, user.pin, user.employeeId);
   if (!ok) { err.textContent='Incorrect PIN.'; err.style.display='block'; return; }
 
   // Upgrade plain-text PIN to hash silently
@@ -4836,7 +4856,7 @@ async function submitRegistration() {
   }
 
   const newUser = {
-    employeeId: empId, name, role, pin: await hashPin(pin), email,
+    employeeId: empId, name, role, pin: await hashPin(pin, empId), email,
     managerName: mgrName, managerEmail: mgrEmail, managerEmpId: mgrEmpId,
     qaName, qaEmail, qaEmpId,
     registeredAt: new Date().toISOString(), active: true,
@@ -5086,7 +5106,7 @@ async function submitChangePin() {
   saveDeviceUsers();
   localStorage.setItem('fbd_operators', JSON.stringify(operators));
   // Save to Neon
-  fetch(`${API_URL}/users/${currentUser.employeeId}/pin`, {
+  apiFetch(`${API_URL}/users/${currentUser.employeeId}/pin`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ pin_hash: currentUser.pin }),
@@ -5190,7 +5210,7 @@ async function submitResetPin() {
 
   // 2. Save to Neon so it reaches ANY device this user logs in from
   try {
-    await fetch(`${API_URL}/users/${empId}/pin`, {
+    await apiFetch(`${API_URL}/users/${empId}/pin`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pin_hash: newHash }),
@@ -5643,7 +5663,7 @@ async function approveQueueEntry(entryId, level, approverSig) {
       detail: `Manager approved: ${entry.label}`, status: 'approved' });
     saveApprovalQueue();
     // Update Neon
-    await fetch(`${API_URL}/approvals/${entry.id}`, {
+    await apiFetch(`${API_URL}/approvals/${entry.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ decision: 'approved', decided_by: approverSig.name, overall_status: 'pending_qa' }),
@@ -5659,7 +5679,7 @@ async function approveQueueEntry(entryId, level, approverSig) {
       detail: `QA approved: ${entry.label}`, status: 'approved' });
     saveApprovalQueue();
     // Update Neon
-    await fetch(`${API_URL}/approvals/${entry.id}`, {
+    await apiFetch(`${API_URL}/approvals/${entry.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ decision: 'approved', decided_by: approverSig.name, overall_status: 'approved' }),
@@ -5686,7 +5706,7 @@ async function rejectQueueEntry(entryId, level, approverSig, reason) {
     status: 'rejected' });
   saveApprovalQueue();
   // Update Neon
-  await fetch(`${API_URL}/approvals/${entry.id}`, {
+  await apiFetch(`${API_URL}/approvals/${entry.id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ decision: 'rejected', decided_by: approverSig.name, overall_status: 'rejected' }),
@@ -5715,7 +5735,7 @@ async function applyApprovedChange(entry, qaSig) {
     autoSaveBagToSheet(bag);
     // Save destruction record to Neon
     const rec = bag.destructionRecord;
-    fetch(`${API_URL}/destruction`, {
+    apiFetch(`${API_URL}/destruction`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -5772,7 +5792,7 @@ async function applyApprovedChange(entry, qaSig) {
 // ── Sync to/from Sheets ───────────────────────────────────────
 async function pushApprovalToSheet(entry) {
   try {
-    await fetch(`${API_URL}/approvals`, {
+    await apiFetch(`${API_URL}/approvals`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -5791,7 +5811,7 @@ async function pushApprovalToSheet(entry) {
 
 async function syncApprovalsFromSheet() {
   try {
-    const r    = await fetch(`${API_URL}/approvals`);
+    const r    = await apiFetch(`${API_URL}/approvals`);
     const data = await r.json();
     if (data.approvals) {
       data.approvals.forEach(remote => {
@@ -5820,7 +5840,7 @@ async function updateApprovalsBadge() {
 
   // Fetch from Neon for accurate count
   try {
-    const r    = await fetch(`${API_URL}/approvals`);
+    const r    = await apiFetch(`${API_URL}/approvals`);
     const data = await r.json();
     if (data.approvals) {
       const myEmail = currentUser.email;
@@ -5872,7 +5892,7 @@ async function renderApprovalsPage() {
 
   // Fetch from Neon and merge into _approvalQueue
   try {
-    const r    = await fetch(`${API_URL}/approvals`);
+    const r    = await apiFetch(`${API_URL}/approvals`);
     const data = await r.json();
     if (data.approvals) {
       data.approvals.forEach(a => {
